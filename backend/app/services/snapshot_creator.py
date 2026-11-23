@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.snapshot_registry import describe_registration, register_snapshot_content
 from app.store import store
 
 
@@ -22,6 +23,37 @@ class SnapshotCreatorService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     SNAPSHOT_TYPES = frozenset({"full", "incremental", "daily_sealed"})
+
+    def register_snapshot(
+        self,
+        *,
+        dataset: str,
+        snapshot_type: str,
+        storage_path: str,
+        snapshot_time: str,
+        file_size: str,
+        owner_module: str | None = None,
+        owner_entry_id: int | None = None,
+    ) -> dict[str, Any]:
+        """共用的快照数据登记入口：分配唯一编号并登记业务快照。
+
+        Schema变更的备份和增量合并的合并后快照都由这里落库，
+        快照内容由各自业务模块准备，编号在并发登记时也不会重复。
+        """
+        row, continued = register_snapshot_content(
+            dataset=dataset,
+            snapshot_type=snapshot_type,
+            storage_path=storage_path,
+            snapshot_time=snapshot_time,
+            file_size=file_size,
+            owner_module=owner_module,
+            owner_entry_id=owner_entry_id,
+        )
+        return {
+            "ok": True,
+            "snapshot_id": row["id"],
+            "registration": describe_registration(row, continued),
+        }
 
     def create_snapshot_with_lineage(self, entry_id: int) -> dict[str, Any]:
         """创建快照并同步记录血缘关系。

@@ -7,6 +7,14 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.snapshot_registry import (
+    SCHEMA_BACKUP_TYPE,
+    SCHEMA_CHANGE_OWNER,
+    describe_registration,
+    find_schema_backup,
+    register_snapshot_content,
+    schema_backup_path,
+)
 from app.store import store
 
 
@@ -21,6 +29,20 @@ class SchemaChangeService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     CHANGE_TYPES = frozenset({"ADD_COLUMN", "DROP_COLUMN", "MODIFY_TYPE", "RENAME_COLUMN", "RENAME_TABLE"})
+
+    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+        """把页面动作接到领域流程：执行变更走备份登记，回退变更走备份核对。"""
+        if action == "执行变更":
+            result = self.execute_with_backup(entry_id)
+            if not result.get("ok"):
+                return None, result.get("message", "执行变更失败")
+            return store.find(self.MODULE, entry_id), result["message"]
+        if action == "回退变更":
+            result = self.rollback_change(entry_id)
+            if not result.get("ok"):
+                return None, result.get("message", "回退变更失败")
+            return store.find(self.MODULE, entry_id), result["message"]
+        return super().run_action(entry_id, action)
 
     def assess_compatibility(self, entry_id: int) -> dict[str, Any]:
         """评估Schema变更的兼容性。
@@ -67,7 +89,8 @@ class SchemaChangeService(BaseModuleService):
         """执行Schema变更并保留备份快照。
 
         执行前自动创建目标表的Schema快照，
-        变更失败时可据此回退。快照记录在 snapshot_creator 模块。
+        变更失败时可据此回退。快照内容由本模块提供，
+        编号分配和登记走 snapshot_registry 的共用流程。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
@@ -76,20 +99,19 @@ class SchemaChangeService(BaseModuleService):
             return {"ok": False, "message": "只有待审批的变更记录才能执行"}
 
         assessment = self.assess_compatibility(entry_id)
+        target_table = entry.get("目标表", "")
 
-        snapshot_rows = store.rows("snapshot_creator")
-        snap_id = max((int(r.get("id", 0)) for r in snapshot_rows), default=0) + 1
-        snapshot_rows.append({
-            "id": snap_id,
-            "status": "已完成",
-            "目标数据集": f"{entry.get('目标表')}_schema",
-            "快照时间点": "2026-11-21T08:00:00Z",
-            "快照类型": "schema_backup",
-            "存储路径": f"/schemas/backup/{entry.get('目标表')}_pre_change_{entry_id}",
-            "文件大小": "0.01 GB",
-            "pending": False,
-            "abnormal": False,
-        })
+        snapshot_row, continued = register_snapshot_content(
+            dataset=f"{target_table}_schema",
+            snapshot_type=SCHEMA_BACKUP_TYPE,
+            storage_path=schema_backup_path(target_table, entry_id),
+            snapshot_time="2026-11-21T08:00:00Z",
+            file_size="0.01 GB",
+            owner_module=SCHEMA_CHANGE_OWNER,
+            owner_entry_id=entry_id,
+        )
+        snap_id = int(snapshot_row["id"])
+        entry["备份快照编号"] = snap_id
 
         entry["status"] = "已执行"
         entry["变更时间"] = "2026-11-21T08:00:00Z"
@@ -99,6 +121,7 @@ class SchemaChangeService(BaseModuleService):
             "ok": True,
             "change_id": entry_id,
             "backup_snapshot_id": snap_id,
+            "backup_registration": describe_registration(snapshot_row, continued),
             "assessment": assessment,
             "message": f"Schema变更已执行，备份快照ID: {snap_id}",
         }
@@ -107,7 +130,8 @@ class SchemaChangeService(BaseModuleService):
         """回退已执行的Schema变更。
 
         使用执行前创建的备份快照恢复原始Schema，
-        记录回退原因和影响范围。
+        记录回退原因和影响范围。老变更单没有备份编号时，
+        按路径尾部编号精确匹配本单自己的备份，绝不误用同前缀的备份。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
@@ -115,20 +139,35 @@ class SchemaChangeService(BaseModuleService):
         if entry.get("status") != "已执行":
             return {"ok": False, "message": "只有已执行的变更记录才能回退"}
 
-        snapshot_rows = store.rows("snapshot_creator")
-        backup_snapshots = [
-            s for s in snapshot_rows
-            if f"_pre_change_{entry_id}" in s.get("存储路径", "")
-        ]
+        backup_id = entry.get("备份快照编号")
+        try:
+            backup_id = int(backup_id) if backup_id not in (None, "") else None
+        except (TypeError, ValueError):
+            backup_id = None
 
+        backup_snapshot = find_schema_backup(
+            entry_id, backup_id, target_table=entry.get("目标表", ""))
+        if backup_snapshot is None:
+            # 缺少对应备份时明确失败，变更单和快照登记都保持原样。
+            return {
+                "ok": False,
+                "change_id": entry_id,
+                "deployed_snapshot_id": None,
+                "message": f"变更记录 {entry_id} 缺少对应的备份快照，无法回退",
+            }
+
+        deployed_id = int(backup_snapshot["id"])
         entry["status"] = "已回退"
         entry["abnormal"] = True
+        entry["备份快照编号"] = deployed_id
+        entry["回退快照编号"] = deployed_id
 
         return {
             "ok": True,
             "change_id": entry_id,
-            "deployed_snapshot_id": backup_snapshots[0]["id"] if backup_snapshots else None,
-            "message": f"变更已回退，恢复自快照",
+            "deployed_snapshot_id": deployed_id,
+            "backup_registration": describe_registration(backup_snapshot, False),
+            "message": f"变更已回退，恢复自快照 {deployed_id}",
         }
 
     def list_pending_changes_by_table(self, table_name: str) -> dict[str, Any]:

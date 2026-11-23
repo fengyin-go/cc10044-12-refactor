@@ -7,6 +7,12 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.snapshot_registry import (
+    DELTA_MERGE_OWNER,
+    DELTA_MERGE_POST_TYPE,
+    describe_registration,
+    register_snapshot_content,
+)
 from app.store import store
 
 
@@ -93,24 +99,23 @@ class DeltaMergeService(BaseModuleService):
         entry["合并状态"] = "完成"
         entry["pending"] = False
 
-        snapshot_service_rows = store.rows("snapshot_creator")
-        snap_id = max((int(r.get("id", 0)) for r in snapshot_service_rows), default=0) + 1
-        snapshot_service_rows.append({
-            "id": snap_id,
-            "status": "已完成",
-            "目标数据集": entry.get("目标表"),
-            "快照时间点": "2026-11-21T08:00:00Z",
-            "快照类型": "delta_merge_post",
-            "存储路径": f"/snapshots/{entry.get('目标表')}/merge_{entry_id}",
-            "文件大小": "2.4 GB",
-            "pending": False,
-            "abnormal": False,
-        })
+        target_table = entry.get("目标表", "")
+        snapshot_row, continued = register_snapshot_content(
+            dataset=target_table,
+            snapshot_type=DELTA_MERGE_POST_TYPE,
+            storage_path=f"/snapshots/{target_table}/merge_{entry_id}",
+            snapshot_time="2026-11-21T08:00:00Z",
+            file_size="2.4 GB",
+            owner_module=DELTA_MERGE_OWNER,
+            owner_entry_id=entry_id,
+        )
+        snap_id = int(snapshot_row["id"])
 
         return {
             "ok": True,
             "plan": plan,
             "snapshot_id": snap_id,
+            "snapshot_registration": describe_registration(snapshot_row, continued),
             "message": f"合并完成：{plan['total_delta_records']} 条记录已应用，{plan['conflicts']} 条冲突已按 {entry.get('冲突策略')} 处理",
         }
 
